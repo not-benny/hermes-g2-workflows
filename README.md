@@ -22,7 +22,8 @@ It is one half of a dual-role bridge:
 
 - `g2-device`: the phone is the MCP server for device and lens operations.
 - `hermes-control`: Hermes is the MCP server for voice turns, cancellation,
-  and the status-only Cockpit resource. Companion is deliberately unavailable.
+  a bounded Cockpit state resource, and exact Cockpit commands. Companion is
+  deliberately unavailable.
 
 The authenticated WSS is transport only. Workflow tools reach the live device
 through a same-UID, private Unix relay owned by the native platform adapter.
@@ -42,6 +43,13 @@ Durable mutators (Work Tasks, Clock, and reminders) derive a content-free
 operation ID from trusted call identity so a bounded transport retry reuses the
 same ID. Legacy phone actions without operation-ID support are never retried;
 a lost response is reported as an unknown outcome instead of claiming success.
+
+Weather and train workflows distinguish data-provider failures from two exact
+pre-delivery display conflicts. An active Clock alert or another assistant
+presentation returns a typed `presentation_blocked` result with no claim that
+the underlying feed is unavailable. Terminal Clock feedback can yield
+atomically to a new dashboard; an actively sounding Clock alert retains display
+and ring priority.
 
 Run the deterministic fake-relay suite with:
 

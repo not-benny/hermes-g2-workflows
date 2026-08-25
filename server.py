@@ -44,7 +44,7 @@ from device_workflows import (
 from relay_client import MAX_BYTES, RelayError, call_relay
 
 
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 SERVER_NAME = "hermes-g2-workflows"
 CAPABILITY_META_KEY = "com.hermes/capability"
 CAPABILITY_AUDIENCE = "com.hermes.mcp/portable/hermes-g2-workflows/workflows"
@@ -69,6 +69,14 @@ _CLOCK_TIME = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
 _DASHBOARD_KEY = re.compile(r"^weather-[a-f0-9]{32}$")
 _OPERATION_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _CONTEXT_DASHBOARD_ID = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_PRESENTATION_BLOCKED_MESSAGES = {
+    "clock_alert_active": (
+        "The glasses display is busy with an active Clock alert."
+    ),
+    "assistant_presentation_active": (
+        "The glasses display is busy with another assistant presentation."
+    ),
+}
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _WORK_TASK_ID = re.compile(r"^wt_[a-f0-9]{32}$")
 _CLOCK_ITEM_ID = re.compile(r"^clk_[a-f0-9]{32}$")
@@ -554,7 +562,35 @@ def _decode_present_result(
         or _OPERATION_ID.fullmatch(operation_id) is None
         or not isinstance(dashboard_key, str)
         or _OPERATION_ID.fullmatch(dashboard_key) is None
-        or not isinstance(value, dict)
+    ):
+        raise ValueError("context presentation identity is malformed")
+    if isinstance(value, dict) and value.get("success") is False:
+        error_code = value.get("error_code")
+        if (
+            set(value)
+            != {
+                "success",
+                "commit_state",
+                "operation_id",
+                "error_code",
+                "error",
+            }
+            or value.get("commit_state") != "not_committed"
+            or value.get("operation_id") != operation_id
+            or not isinstance(error_code, str)
+            or error_code not in _PRESENTATION_BLOCKED_MESSAGES
+            or value.get("error")
+            != _PRESENTATION_BLOCKED_MESSAGES[error_code]
+        ):
+            raise ValueError("context presentation rejection is malformed")
+        return {
+            "success": False,
+            "state": "presentation_blocked",
+            "error_code": error_code,
+            "error": value["error"],
+        }
+    if (
+        not isinstance(value, dict)
         or set(value) != {"success", "receipt"}
         or value.get("success") is not True
         or not isinstance(value.get("receipt"), dict)
@@ -1035,11 +1071,13 @@ class WorkflowService:
                 "regeneration": "self_contained_intent" if fresh else "current_turn_only",
                 "spec": spec,
             })
-            _decode_present_result(
+            presentation = _decode_present_result(
                 presented,
                 operation_id=operation_id,
                 dashboard_key=key,
             )
+            if presentation.get("success") is False:
+                return presentation
             return {"success": True, "dashboard_key": key, "title": title, "summary": primary}
         except (RelayError, ValueError, KeyError, TypeError):
             return {"success": False, "error": "Weather could not be presented safely"}
@@ -1068,11 +1106,13 @@ class WorkflowService:
                 "regeneration": "self_contained_intent",
                 "spec": spec,
             })
-            _decode_present_result(
+            presentation = _decode_present_result(
                 presented,
                 operation_id=operation_id,
                 dashboard_key=key,
             )
+            if presentation.get("success") is False:
+                return presentation
             return {
                 "success": True,
                 "dashboard_key": key,
@@ -1103,6 +1143,16 @@ _PUBLIC_FAILURE_SCHEMA = _object_schema({
     "state": {"type": "string", "enum": ["not_committed", "outcome_unknown", "error"]},
     "error": {"type": "string", "minLength": 1, "maxLength": 240},
 }, ["success", "state", "error"])
+
+_PRESENTATION_BLOCKED_SCHEMAS = tuple(
+    _object_schema({
+        "success": {"const": False},
+        "state": {"const": "presentation_blocked"},
+        "error_code": {"const": error_code},
+        "error": {"const": error},
+    }, ["success", "state", "error_code", "error"])
+    for error_code, error in _PRESENTATION_BLOCKED_MESSAGES.items()
+)
 
 _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "g2_work_task_add": _one_of(
@@ -1172,6 +1222,7 @@ _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "success": {"const": False},
             "error": {"type": "string", "minLength": 1, "maxLength": 240},
         }, ["success", "error"]),
+        *_PRESENTATION_BLOCKED_SCHEMAS,
     ),
     "g2_train_departures_present": _one_of(
         _object_schema({
@@ -1184,6 +1235,7 @@ _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "success": {"const": False},
             "error": {"type": "string", "minLength": 1, "maxLength": 240},
         }, ["success", "error"]),
+        *_PRESENTATION_BLOCKED_SCHEMAS,
     ),
 }
 

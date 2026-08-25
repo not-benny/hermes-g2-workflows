@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "hermes-g2-workflows",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "High-level, policy-owning MCP workflows for the Hermes G2 bridge.",
   "author": {"name": "Hermes G2 contributors"},
   "license": "Apache-2.0",

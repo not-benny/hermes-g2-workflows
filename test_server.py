@@ -110,6 +110,27 @@ def present_receipt(
     return make
 
 
+def present_blocked(error_code: str):
+    messages = {
+        "clock_alert_active": (
+            "The glasses display is busy with an active Clock alert."
+        ),
+        "assistant_presentation_active": (
+            "The glasses display is busy with another assistant presentation."
+        ),
+    }
+
+    def make(_name, arguments, _authorization):
+        return {
+            "success": False,
+            "commit_state": "not_committed",
+            "operation_id": arguments["operation_id"],
+            "error_code": error_code,
+            "error": messages[error_code],
+        }
+    return make
+
+
 async def initialized_server(relay: FakeRelay) -> server.WorkflowMcpServer:
     instance = server.WorkflowMcpServer(server.WorkflowService(relay))
     response = await instance.handle_message({
@@ -226,6 +247,35 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("operation_id", item["inputSchema"]["properties"])
                 self.assertNotIn("platform", item["inputSchema"]["properties"])
                 self.assertNotIn("profile", item["inputSchema"]["properties"])
+
+        blocked_messages = {
+            "clock_alert_active": (
+                "The glasses display is busy with an active Clock alert."
+            ),
+            "assistant_presentation_active": (
+                "The glasses display is busy with another assistant presentation."
+            ),
+        }
+        for name in ("g2_weather_present", "g2_train_departures_present"):
+            item = next(tool for tool in tools if tool["name"] == name)
+            variants = item["outputSchema"]["oneOf"]
+            blockers = [
+                variant for variant in variants
+                if variant["properties"].get("state", {}).get("const")
+                == "presentation_blocked"
+            ]
+            self.assertEqual(len(blockers), 2)
+            self.assertEqual({
+                variant["properties"]["error_code"]["const"]:
+                variant["properties"]["error"]["const"]
+                for variant in blockers
+            }, blocked_messages)
+            for variant in blockers:
+                self.assertEqual(
+                    set(variant["required"]),
+                    {"success", "state", "error_code", "error"},
+                )
+                self.assertIs(variant["additionalProperties"], False)
 
         result, payload = await call_tool(
             instance,
@@ -601,6 +651,89 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
         }])
         self.assertEqual(spec["sources"][0]["observed_at_ms"], 1_787_702_399_000)
 
+    async def test_weather_and_train_preserve_exact_display_busy_rejections(self) -> None:
+        weather = {
+            "success": True,
+            "trust": "typed_open_meteo_ukmo_data",
+            "dashboard_key": "weather-0123456789abcdef0123456789abcdef",
+            "title": "Liverpool · Tomorrow",
+            "result": {
+                "location_label": "Liverpool",
+                "date": "2026-08-26",
+                "weather_code": 61,
+                "condition": "rain",
+                "temperature_min_c": 9.7,
+                "temperature_max_c": 17.2,
+                "precipitation_probability_max_pct": 70,
+                "precipitation_amount_mm": 3.4,
+                "wind_speed_max_kmh": 29.6,
+                "source": "Open-Meteo · UK Met Office data",
+                "observed_at_ms": 1_787_702_399_000,
+            },
+        }
+        train = {
+            "success": True,
+            "trust": "typed_national_rail_data",
+            "result": {
+                "source": "National Rail",
+                "origin_crs": "BLN",
+                "destination_crs": "LVC",
+                "data_kind": "live",
+                "observed_at_ms": 1_787_702_399_000,
+                "departures": [{
+                    "scheduled_departure_ms": 1_787_702_400_000,
+                    "scheduled_arrival_ms": 1_787_703_000_000,
+                    "status": "on_time",
+                }],
+            },
+        }
+        relay = FakeRelay({
+            "g2.weather.read_forecast": [weather],
+            "g2.transit.read_departures": [train],
+            "g2.context.present": [
+                present_blocked("clock_alert_active"),
+                present_blocked("assistant_presentation_active"),
+            ],
+        })
+        instance = await initialized_server(relay)
+
+        weather_result, weather_payload = await call_tool(
+            instance,
+            "g2_weather_present",
+            {"location": "Liverpool", "day_offset": 1},
+            meta=session_meta(
+                "g2_weather_present",
+                {"location": "Liverpool", "day_offset": 1},
+                "weather-display-busy",
+            ),
+        )
+        train_result, train_payload = await call_tool(
+            instance,
+            "g2_train_departures_present",
+            {"origin_crs": "BLN", "destination_crs": "LVC"},
+            meta=session_meta(
+                "g2_train_departures_present",
+                {"origin_crs": "BLN", "destination_crs": "LVC"},
+                "train-display-busy",
+            ),
+            request_id=11,
+        )
+
+        self.assertIs(weather_result["isError"], True)
+        self.assertEqual(weather_payload, {
+            "success": False,
+            "state": "presentation_blocked",
+            "error_code": "clock_alert_active",
+            "error": "The glasses display is busy with an active Clock alert.",
+        })
+        self.assertIs(train_result["isError"], True)
+        self.assertEqual(train_payload, {
+            "success": False,
+            "state": "presentation_blocked",
+            "error_code": "assistant_presentation_active",
+            "error": "The glasses display is busy with another assistant presentation.",
+        })
+
     async def test_context_present_receipt_is_exact_and_bound_to_the_requested_frame(self) -> None:
         operation_id = "weather." + "a" * 32
         dashboard_key = "weather-" + "b" * 32
@@ -623,6 +756,36 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
             dashboard_key=dashboard_key,
         )
         self.assertEqual(receipt["frame_id"], 17)
+
+        blocked_messages = {
+            "clock_alert_active": (
+                "The glasses display is busy with an active Clock alert."
+            ),
+            "assistant_presentation_active": (
+                "The glasses display is busy with another assistant presentation."
+            ),
+        }
+        for error_code, error in blocked_messages.items():
+            blocked = {
+                "success": False,
+                "commit_state": "not_committed",
+                "operation_id": operation_id,
+                "error_code": error_code,
+                "error": error,
+            }
+            self.assertEqual(
+                server._decode_present_result(
+                    blocked,
+                    operation_id=operation_id,
+                    dashboard_key=dashboard_key,
+                ),
+                {
+                    "success": False,
+                    "state": "presentation_blocked",
+                    "error_code": error_code,
+                    "error": error,
+                },
+            )
 
         historical = copy.deepcopy(good)
         historical["receipt"]["status"] = "historical_acknowledgement"
@@ -651,6 +814,42 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
             "short dashboard id": copy.deepcopy(good),
             "extra receipt field": copy.deepcopy(good),
             "missing receipt field": copy.deepcopy(good),
+            "unknown rejection code": {
+                "success": False,
+                "commit_state": "not_committed",
+                "operation_id": operation_id,
+                "error_code": "feed_unavailable",
+                "error": "private provider detail",
+            },
+            "non-string rejection code": {
+                "success": False,
+                "commit_state": "not_committed",
+                "operation_id": operation_id,
+                "error_code": ["clock_alert_active"],
+                "error": "private provider detail",
+            },
+            "rejection message mismatch": {
+                "success": False,
+                "commit_state": "not_committed",
+                "operation_id": operation_id,
+                "error_code": "clock_alert_active",
+                "error": "private provider detail",
+            },
+            "rejection operation mismatch": {
+                "success": False,
+                "commit_state": "not_committed",
+                "operation_id": "weather." + "d" * 32,
+                "error_code": "clock_alert_active",
+                "error": blocked_messages["clock_alert_active"],
+            },
+            "extra rejection field": {
+                "success": False,
+                "commit_state": "not_committed",
+                "operation_id": operation_id,
+                "error_code": "clock_alert_active",
+                "error": blocked_messages["clock_alert_active"],
+                "detail": "private provider detail",
+            },
         }
         malformed["mismatched operation"]["receipt"]["operation_id"] = "weather." + "d" * 32
         malformed["mismatched dashboard key"]["receipt"]["dashboard_key"] = "weather-error"

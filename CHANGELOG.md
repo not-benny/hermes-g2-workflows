@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 - 2026-08-25
+
+- Preserved exact display-busy rejections for weather and train dashboards so
+  Clock or assistant ownership is not misreported as a provider outage.
+- Documented the Host MCP Cockpit state and command boundary used by the G2
+  companion app.
+
 ## 0.3.0 - 2026-08-25
 
 - Added twelve static G2 workflows with exact input and output schemas.
