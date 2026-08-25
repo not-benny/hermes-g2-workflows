@@ -246,6 +246,24 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("from mcp", source)
         self.assertNotIn("import mcp", source)
 
+    async def test_initialize_instructions_route_task_destinations(self) -> None:
+        instance = server.WorkflowMcpServer(server.WorkflowService(FakeRelay()))
+        response = await instance.handle_message({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1"},
+            },
+        })
+        self.assertIsNotNone(response)
+        instructions = response["result"]["instructions"]
+        self.assertIn("ordinary unqualified task", instructions)
+        self.assertIn("explicit Kanban request", instructions)
+        self.assertIn("mutate neither task store", instructions)
+
     async def test_list_and_call_expose_intent_only_schemas(self) -> None:
         relay = FakeRelay({
             "g2.work_tasks.add": [
@@ -271,6 +289,39 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("operation_id", item["inputSchema"]["properties"])
                 self.assertNotIn("platform", item["inputSchema"]["properties"])
                 self.assertNotIn("profile", item["inputSchema"]["properties"])
+
+        work_tool = next(
+            item for item in tools if item["name"] == "g2_work_task_add"
+        )
+        kanban_tool = next(
+            item for item in tools if item["name"] == "g2_kanban_task_create"
+        )
+        self.assertIn("ordinary unqualified", work_tool["description"])
+        self.assertIn("explicitly says Kanban", work_tool["description"])
+        self.assertIn("current wearer request", kanban_tool["description"])
+        self.assertIn("fresh turn", kanban_tool["description"])
+        routing_codes = {
+            "kanban_board_not_named",
+            "task_board_target_conflict",
+            "task_destination_change_requires_fresh_turn",
+            "work_tasks_not_authorized",
+            "work_tasks_requested",
+        }
+        observed_routing = {}
+        for item in (work_tool, kanban_tool):
+            for variant in item["outputSchema"]["oneOf"]:
+                code = variant["properties"].get("error_code", {}).get("const")
+                if code in routing_codes:
+                    observed_routing[code] = variant["properties"]["error"]["const"]
+                    self.assertEqual(
+                        set(variant["required"]),
+                        {"success", "state", "error_code", "error"},
+                    )
+                    self.assertIs(variant["additionalProperties"], False)
+        self.assertEqual(
+            observed_routing,
+            server._TASK_ROUTING_ERROR_MESSAGES,
+        )
 
         train = next(
             item for item in tools
@@ -463,6 +514,123 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
             "boards_truncated": False,
         })
         self.assertEqual(len(relay.calls), 1)
+
+    async def test_task_board_routing_failures_are_exact_and_not_retried(
+        self,
+    ) -> None:
+        messages = server._TASK_ROUTING_ERROR_MESSAGES
+        work_arguments = {"title": "Follow up", "lane": "inbox"}
+        kanban_arguments = {"title": "Follow up", "board": "Hermes G2"}
+        relay = FakeRelay({
+            "g2.work_tasks.add": [{
+                "success": False,
+                "commit_state": "not_committed",
+                "error_code": "work_tasks_not_authorized",
+                "error": messages["work_tasks_not_authorized"],
+            }],
+            "g2.kanban.task.create": [
+                {
+                    "success": False,
+                    "commit_state": "not_committed",
+                    "error_code": "work_tasks_requested",
+                    "error": messages["work_tasks_requested"],
+                },
+                {
+                    "success": False,
+                    "commit_state": "not_committed",
+                    "error_code": "task_destination_change_requires_fresh_turn",
+                    "error": messages[
+                        "task_destination_change_requires_fresh_turn"
+                    ],
+                },
+            ],
+        })
+        instance = await initialized_server(relay)
+
+        work_result, work_payload = await call_tool(
+            instance,
+            "g2_work_task_add",
+            work_arguments,
+            meta=session_meta(
+                "g2_work_task_add", work_arguments, "work-routing-call"
+            ),
+        )
+        self.assertIs(work_result["isError"], True)
+        self.assertEqual(work_payload, {
+            "success": False,
+            "state": "not_committed",
+            "error_code": "work_tasks_not_authorized",
+            "error": messages["work_tasks_not_authorized"],
+        })
+
+        for request_id, error_code in enumerate(
+            (
+                "work_tasks_requested",
+                "task_destination_change_requires_fresh_turn",
+            ),
+            start=20,
+        ):
+            result, payload = await call_tool(
+                instance,
+                "g2_kanban_task_create",
+                kanban_arguments,
+                meta=session_meta(
+                    "g2_kanban_task_create",
+                    kanban_arguments,
+                    f"kanban-routing-call-{request_id}",
+                ),
+                request_id=request_id,
+            )
+            self.assertIs(result["isError"], True)
+            self.assertEqual(payload, {
+                "success": False,
+                "state": "not_committed",
+                "error_code": error_code,
+                "error": messages[error_code],
+            })
+        self.assertEqual(len(relay.calls), 3)
+
+        malformed = {
+            "success": False,
+            "commit_state": "not_committed",
+            "error_code": "work_tasks_requested",
+            "error": "changed",
+        }
+        with self.assertRaisesRegex(ValueError, "routing failure"):
+            server._decode_kanban_task_result(
+                malformed,
+                operation_id="kanban." + "1" * 32,
+            )
+        malformed["error"] = messages["work_tasks_requested"]
+        malformed["extra"] = True
+        fallback = server._decode_kanban_task_result(
+            malformed,
+            operation_id="kanban." + "1" * 32,
+        )
+        self.assertEqual(fallback["state"], "error")
+
+        for error_code in (
+            "kanban_board_not_named",
+            "task_board_target_conflict",
+        ):
+            native = {
+                "success": False,
+                "commit_state": "not_committed",
+                "error_code": error_code,
+                "error": messages[error_code],
+            }
+            self.assertEqual(
+                server._decode_kanban_task_result(
+                    native,
+                    operation_id="kanban." + "2" * 32,
+                ),
+                {
+                    "success": False,
+                    "state": "not_committed",
+                    "error_code": error_code,
+                    "error": messages[error_code],
+                },
+            )
 
     async def test_kanban_committed_payload_conflict_is_typed_and_not_retried(
         self,

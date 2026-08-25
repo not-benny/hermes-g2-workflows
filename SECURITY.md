@@ -10,7 +10,8 @@ text, calendar data, notifications, health data, or live gateway addresses in a
 public issue.
 
 The package is not a standalone glasses bridge. Its current security contract
-requires the reviewed Hermes session-capability implementation, an authenticated
-native transport, a private schema-pinned phone Device MCP, and an exact
-`even-g2` profile. The current native bridge is not part of this Apache-2.0
-package and is not cleared for public redistribution.
+requires the reviewed Hermes session-capability implementation, the separately
+published Apache-2.0
+[`hermes-g2-bridge`](https://github.com/not-benny/hermes-g2-bridge), a private
+schema-pinned phone Device MCP, and an exact `even-g2` profile. The bridge
+remains outside this package and its package digest.

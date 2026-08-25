@@ -44,7 +44,7 @@ from device_workflows import (
 from relay_client import MAX_BYTES, RelayError, call_relay
 
 
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.4.1"
 SERVER_NAME = "hermes-g2-workflows"
 CAPABILITY_META_KEY = "com.hermes/capability"
 CAPABILITY_AUDIENCE = "com.hermes.mcp/portable/hermes-g2-workflows/workflows"
@@ -91,6 +91,25 @@ _KANBAN_OPERATION_ERROR_MESSAGES = {
     ),
     "operation_outcome_unknown": (
         "Kanban creation may have started but its exact outcome is unknown"
+    ),
+}
+_TASK_ROUTING_ERROR_MESSAGES = {
+    "work_tasks_requested": (
+        "The wearer requested the onboard Work Tasks board, not Hermes Kanban"
+    ),
+    "kanban_board_not_named": (
+        "The current wearer request did not name this Hermes Kanban board"
+    ),
+    "task_board_target_conflict": (
+        "The wearer request names conflicting task-board destinations; ask which "
+        "one in a fresh turn"
+    ),
+    "work_tasks_not_authorized": (
+        "The wearer requested Hermes Kanban; ask for its exact board in a fresh "
+        "turn instead of using Work Tasks"
+    ),
+    "task_destination_change_requires_fresh_turn": (
+        "Selecting a different task-board destination requires a fresh wearer request"
     ),
 }
 _CLOCK_ITEM_ID = re.compile(r"^clk_[a-f0-9]{32}$")
@@ -669,10 +688,47 @@ def _mutation_envelope(value: Any) -> dict[str, Any]:
     return value["receipt"]
 
 
+def _decode_task_routing_failure(
+    value: Any, *, allowed_codes: set[str]
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "success",
+        "commit_state",
+        "error_code",
+        "error",
+    }:
+        return None
+    error_code = value.get("error_code")
+    if (
+        value.get("success") is not False
+        or value.get("commit_state") != "not_committed"
+        or not isinstance(error_code, str)
+        or error_code not in allowed_codes
+        or value.get("error") != _TASK_ROUTING_ERROR_MESSAGES.get(error_code)
+    ):
+        raise ValueError("task routing failure is malformed")
+    return {
+        "success": False,
+        "state": "not_committed",
+        "error_code": error_code,
+        "error": _TASK_ROUTING_ERROR_MESSAGES[error_code],
+    }
+
+
 def _decode_work_task_result(
     value: Any, *, operation_id: str, lane: str
 ) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("success") is False:
+        routing = _decode_task_routing_failure(
+            value,
+            allowed_codes={
+                "task_destination_change_requires_fresh_turn",
+                "task_board_target_conflict",
+                "work_tasks_not_authorized",
+            },
+        )
+        if routing is not None:
+            return routing
         return _public_failure(value, "Work Tasks returned an invalid receipt")
     receipt = _mutation_envelope(value)
     if set(receipt) != {"status", "operation_id", "task_id", "lane", "board_revision"}:
@@ -702,6 +758,17 @@ def _decode_kanban_task_result(
 ) -> dict[str, Any]:
     """Reduce the native Kanban receipt to its exact public projection."""
     if isinstance(value, dict) and value.get("success") is False:
+        routing = _decode_task_routing_failure(
+            value,
+            allowed_codes={
+                "kanban_board_not_named",
+                "task_destination_change_requires_fresh_turn",
+                "task_board_target_conflict",
+                "work_tasks_requested",
+            },
+        )
+        if routing is not None:
+            return routing
         if set(value) == {
             "success",
             "commit_state",
@@ -1345,6 +1412,15 @@ _KANBAN_SELECTION_FAILURE_SCHEMA = _object_schema({
     "available_boards",
     "boards_truncated",
 ])
+_TASK_ROUTING_FAILURE_SCHEMAS = {
+    error_code: _object_schema({
+        "success": {"const": False},
+        "state": {"const": "not_committed"},
+        "error_code": {"const": error_code},
+        "error": {"const": error},
+    }, ["success", "state", "error_code", "error"])
+    for error_code, error in _TASK_ROUTING_ERROR_MESSAGES.items()
+}
 _KANBAN_OPERATION_FAILURE_SCHEMAS = tuple(
     _object_schema({
         "success": {"const": False},
@@ -1371,6 +1447,11 @@ _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "lane": {"type": "string", "enum": ["inbox", "today", "doing"]},
             "board_revision": {"type": "integer", "minimum": 1, "maximum": MAX_SAFE_INTEGER},
         }, ["success", "state", "status", "task_id", "lane", "board_revision"]),
+        _TASK_ROUTING_FAILURE_SCHEMAS[
+            "task_destination_change_requires_fresh_turn"
+        ],
+        _TASK_ROUTING_FAILURE_SCHEMAS["task_board_target_conflict"],
+        _TASK_ROUTING_FAILURE_SCHEMAS["work_tasks_not_authorized"],
         _PUBLIC_FAILURE_SCHEMA,
     ),
     "g2_kanban_task_create": _one_of(
@@ -1390,6 +1471,12 @@ _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "created_assignee", "board",
         ]),
         _KANBAN_SELECTION_FAILURE_SCHEMA,
+        _TASK_ROUTING_FAILURE_SCHEMAS["kanban_board_not_named"],
+        _TASK_ROUTING_FAILURE_SCHEMAS[
+            "task_destination_change_requires_fresh_turn"
+        ],
+        _TASK_ROUTING_FAILURE_SCHEMAS["task_board_target_conflict"],
+        _TASK_ROUTING_FAILURE_SCHEMAS["work_tasks_requested"],
         *_KANBAN_OPERATION_FAILURE_SCHEMAS,
         _PUBLIC_FAILURE_SCHEMA,
     ),
@@ -1470,7 +1557,14 @@ _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
 TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "g2_work_task_add",
-        "description": "Add a day-job task to the wearer's local Work Tasks app, never Hermes Kanban or todo.",
+        "description": (
+            "Add one item to the phone's onboard local Work Tasks board. Use "
+            "this for explicit onboard, on-device, phone, local, Work Tasks, "
+            "inbox, today, or doing requests, and for an ordinary unqualified "
+            "or unnamed board-task request. If the wearer explicitly says "
+            "Kanban without naming its exact board, ask for that board and "
+            "mutate neither store. Never use Hermes Kanban or todo."
+        ),
         "inputSchema": _object_schema({
             "title": {"type": "string", "minLength": 1, "maxLength": 120},
             "lane": {"type": "string", "enum": ["inbox", "today", "doing"], "default": "inbox"},
@@ -1482,8 +1576,10 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "Create one parked card on an existing Hermes Kanban board whose "
             "slug or display name exactly matches board. The card is created "
             "blocked with no assignee, so this workflow never starts a worker. "
-            "Use this for Hermes Kanban or named board requests; never substitute "
-            "the phone's local Work Tasks app."
+            "Use only when the current wearer request explicitly names that "
+            "Hermes Kanban board. After a missing or ambiguous board result, ask "
+            "the wearer in a fresh turn; never choose a listed board yourself or "
+            "substitute the phone's local Work Tasks app."
         ),
         "inputSchema": _object_schema({
             "title": {"type": "string", "minLength": 1, "maxLength": 120},
@@ -1674,8 +1770,13 @@ class WorkflowMcpServer:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
-                    "Use these intent-complete tools for G2 Work Tasks, parked Hermes "
-                    "Kanban cards, Clock, reminders, UK trains and UK public weather. "
+                    "Use these intent-complete tools for onboard G2 Work Tasks, "
+                    "explicitly named parked Hermes Kanban cards, Clock, reminders, "
+                    "UK trains and UK public weather. Explicit onboard, local, "
+                    "phone, or Work Tasks requests and ordinary unqualified task "
+                    "or unnamed board-task requests belong to Work Tasks. An "
+                    "explicit Kanban request without one exact destination requires "
+                    "clarification and must mutate neither task store. "
                     "Do not rebuild "
                     "these workflows with terminal, cron, browser, or arbitrary phone tools."
                 ),

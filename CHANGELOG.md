@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 - 2026-08-25
+
+- Bound Hermes Kanban creation to an exact board name spoken in the current
+  wearer turn. A model cannot carry a board name from prior context.
+- Bound every task-store call in one wearer turn to one exact destination. A
+  missing or ambiguous board must be clarified in a fresh turn, so the model
+  cannot silently select a different board or fall back to Work Tasks.
+- Clarified that onboard, local, ordinary unqualified, and unnamed board-task
+  requests belong to the phone's Work Tasks board. An explicit Kanban request
+  without an exact board name now requires clarification and mutates neither
+  store.
+
 ## 0.4.0 - 2026-08-25
 
 - Added one static `g2_kanban_task_create` workflow for exact existing Hermes
