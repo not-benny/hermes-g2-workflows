@@ -68,6 +68,18 @@ may have begun mutation but has no recoverable exact canonical row stays
 outcome-unknown and will never recreate; this is the deliberate fail-closed
 tradeoff that prevents resurrection.
 
+The exact board must also be named in the current wearer utterance. Every
+task-store call in that wearer turn is bound to the same exact destination. If
+the board is missing or ambiguous, Hermes must ask for a fresh wearer request
+and cannot silently choose another board or fall back to Work Tasks. Requests
+for the onboard task board,
+Work Tasks, a local task board, an ordinary unqualified task, or an unnamed
+board task use `g2_work_task_add` instead. An explicit Kanban request without
+an exact board name asks for clarification and mutates neither store.
+
+The reviewed all-in-one installer and exact component locks are published in
+[`hermes-g2-distribution`](https://github.com/not-benny/hermes-g2-distribution).
+
 Weather and train workflows distinguish data-provider failures from two exact
 pre-delivery display conflicts. An active Clock alert or another assistant
 presentation returns a typed `presentation_blocked` result with no claim that
