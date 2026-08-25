@@ -6,7 +6,10 @@
       "command": "python",
       "args": ["-I", "-S", "-B", "${PLUGIN_ROOT}/server.py"],
       "cwd": "${PLUGIN_ROOT}",
-      "env": {"PYTHONDONTWRITEBYTECODE": "1"}
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HERMES_G2_WORKFLOW_RELAY": "${PLUGIN_DATA}/../../run/g2-workflows.sock"
+      }
     }
   }
 }

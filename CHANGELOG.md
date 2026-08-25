@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 - 2026-08-25
+
+- Routed the isolated workflow process to its profile-scoped private relay.
+  The sanitized MCP environment no longer falls back to another profile's
+  missing socket, so all twelve typed workflows can reach native dispatch.
+- Clarified exact National Rail station identity in the train tool contract,
+  including the distinct Liverpool Central (`LVC`) and Liverpool Lime Street
+  (`LIV`) codes, so a named station is never silently substituted.
+
 ## 0.3.1 - 2026-08-25
 
 - Preserved exact display-busy rejections for weather and train dashboards so

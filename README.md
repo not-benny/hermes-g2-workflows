@@ -27,6 +27,9 @@ It is one half of a dual-role bridge:
 
 The authenticated WSS is transport only. Workflow tools reach the live device
 through a same-UID, private Unix relay owned by the native platform adapter.
+The packaged MCP environment receives only the exact profile-local relay path,
+derived from its host-owned plugin-data root; it does not need the broader
+Hermes profile home.
 The socket is transport isolation, not authority: Hermes signs a package-,
 workflow-, argument-, and turn-bound capability in MCP request `_meta`, and the
 native relay verifies it in process. Platform, profile, phone route, schema
@@ -50,6 +53,11 @@ presentation returns a typed `presentation_blocked` result with no claim that
 the underlying feed is unavailable. Terminal Clock feedback can yield
 atomically to a new dashboard; an actively sounding Clock alert retains display
 and ring priority.
+
+Train calls use the exact CRS for the station the wearer named. The public tool
+contract explicitly distinguishes Blundellsands & Crosby (`BLN`), Liverpool
+Central (`LVC`), and Liverpool Lime Street (`LIV`) so the model cannot replace
+Liverpool Central with the city's mainline station.
 
 Run the deterministic fake-relay suite with:
 

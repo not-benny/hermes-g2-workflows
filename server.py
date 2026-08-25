@@ -44,7 +44,7 @@ from device_workflows import (
 from relay_client import MAX_BYTES, RelayError, call_relay
 
 
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.3.2"
 SERVER_NAME = "hermes-g2-workflows"
 CAPABILITY_META_KEY = "com.hermes/capability"
 CAPABILITY_AUDIENCE = "com.hermes.mcp/portable/hermes-g2-workflows/workflows"
@@ -1287,10 +1287,23 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "g2_train_departures_present",
-        "description": "Read typed National Rail departures and atomically present the final deck.",
+        "description": (
+            "Read typed National Rail departures and atomically present the final deck. "
+            "Use the CRS for the station the user actually named; never substitute a "
+            "nearby mainline station. Blundellsands & Crosby is BLN, Liverpool Central "
+            "is LVC, and Liverpool Lime Street is LIV."
+        ),
         "inputSchema": _object_schema({
-            "origin_crs": {"type": "string", "pattern": _CRS.pattern},
-            "destination_crs": {"type": "string", "pattern": _CRS.pattern},
+            "origin_crs": {
+                "type": "string",
+                "pattern": _CRS.pattern,
+                "description": "Exact National Rail CRS for the named origin (for example BLN for Blundellsands & Crosby).",
+            },
+            "destination_crs": {
+                "type": "string",
+                "pattern": _CRS.pattern,
+                "description": "Exact National Rail CRS for the named destination (LVC is Liverpool Central; LIV is Liverpool Lime Street).",
+            },
         }, ["origin_crs", "destination_crs"]),
     },
 )

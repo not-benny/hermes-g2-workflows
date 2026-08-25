@@ -217,7 +217,15 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
             launch["args"],
             ["-I", "-S", "-B", "${PLUGIN_ROOT}/server.py"],
         )
-        self.assertEqual(launch["env"], {"PYTHONDONTWRITEBYTECODE": "1"})
+        self.assertEqual(
+            launch["env"],
+            {
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HERMES_G2_WORKFLOW_RELAY": (
+                    "${PLUGIN_DATA}/../../run/g2-workflows.sock"
+                ),
+            },
+        )
         source = (root / "server.py").read_text(encoding="utf-8")
         self.assertNotIn("from mcp", source)
         self.assertNotIn("import mcp", source)
@@ -247,6 +255,20 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("operation_id", item["inputSchema"]["properties"])
                 self.assertNotIn("platform", item["inputSchema"]["properties"])
                 self.assertNotIn("profile", item["inputSchema"]["properties"])
+
+        train = next(
+            item for item in tools
+            if item["name"] == "g2_train_departures_present"
+        )
+        self.assertIn("Liverpool Central is LVC", train["description"])
+        self.assertIn(
+            "LVC is Liverpool Central",
+            train["inputSchema"]["properties"]["destination_crs"]["description"],
+        )
+        self.assertIn(
+            "BLN for Blundellsands & Crosby",
+            train["inputSchema"]["properties"]["origin_crs"]["description"],
+        )
 
         blocked_messages = {
             "clock_alert_active": (

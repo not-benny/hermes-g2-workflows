@@ -18,9 +18,13 @@ class RelayError(RuntimeError):
 
 
 def _socket_path() -> Path:
-    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
-    run = home.resolve() / "run"
-    return run / "g2-workflows.sock"
+    raw = os.environ.get("HERMES_G2_WORKFLOW_RELAY")
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise RelayError("G2 workflow relay endpoint is unavailable")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute() or candidate.name != "g2-workflows.sock":
+        raise RelayError("G2 workflow relay endpoint is malformed")
+    return candidate.resolve(strict=False)
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
