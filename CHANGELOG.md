@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0 - 2026-08-25
+
+- Added one static `g2_kanban_task_create` workflow for exact existing Hermes
+  Kanban board slugs or display names. It creates a blocked, unassigned card
+  plus the canonical sticky-block event, and therefore cannot be auto-promoted,
+  start a worker, or enter the default triage auto-decomposer.
+- Made retries duplicate-proof by deriving a content-free operation identity,
+  binding its normalized payload digest to the original board generation in a
+  private durable global ledger, and serializing the canonical Kanban lookup
+  and `create_task` call inside one immediate transaction. Permanent committed
+  tombstones survive card/board deletion and rename/reuse; uncertain mutating
+  tombstones fail closed rather than recreating.
+- Historical receipts expose immutable `created_status` and
+  `created_assignee` facts rather than claiming current card state, and a
+  changed payload after a known commit returns typed `historical_conflict`.
+- Added typed `board_not_found` and `board_ambiguous` results with at most 16
+  canonical active board choices. A Kanban request never falls back to the
+  phone's local Work Tasks app or interprets a status name as a board.
+
 ## 0.3.2 - 2026-08-25
 
 - Routed the isolated workflow process to its profile-scoped private relay.

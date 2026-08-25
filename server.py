@@ -44,7 +44,7 @@ from device_workflows import (
 from relay_client import MAX_BYTES, RelayError, call_relay
 
 
-SERVER_VERSION = "0.3.2"
+SERVER_VERSION = "0.4.0"
 SERVER_NAME = "hermes-g2-workflows"
 CAPABILITY_META_KEY = "com.hermes/capability"
 CAPABILITY_AUDIENCE = "com.hermes.mcp/portable/hermes-g2-workflows/workflows"
@@ -63,6 +63,7 @@ MAX_SESSION_FIELD_BYTES = 512
 MAX_TOOL_TEXT_BYTES = 480
 MAX_NOTIFY_CHARS = 160
 MAX_CLOCK_DURATION_SECONDS = 604_800
+MAX_KANBAN_BOARD_CHOICES = 16
 
 _CRS = re.compile(r"^[A-Z0-9]{3}$")
 _CLOCK_TIME = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
@@ -79,6 +80,19 @@ _PRESENTATION_BLOCKED_MESSAGES = {
 }
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _WORK_TASK_ID = re.compile(r"^wt_[a-f0-9]{32}$")
+_KANBAN_TASK_ID = re.compile(r"^t_[a-f0-9]{8}$")
+_KANBAN_BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_KANBAN_OPERATION_ERROR_MESSAGES = {
+    "operation_conflict": (
+        "Kanban operation identity is already bound to different arguments"
+    ),
+    "board_generation_changed": (
+        "The selected Kanban board changed before the card was created"
+    ),
+    "operation_outcome_unknown": (
+        "Kanban creation may have started but its exact outcome is unknown"
+    ),
+}
 _CLOCK_ITEM_ID = re.compile(r"^clk_[a-f0-9]{32}$")
 _REMINDER_ID = re.compile(r"^[a-f0-9]{32}$")
 _INSTANT = re.compile(
@@ -683,6 +697,125 @@ def _decode_work_task_result(
     }
 
 
+def _decode_kanban_task_result(
+    value: Any, *, operation_id: str
+) -> dict[str, Any]:
+    """Reduce the native Kanban receipt to its exact public projection."""
+    if isinstance(value, dict) and value.get("success") is False:
+        if set(value) == {
+            "success",
+            "commit_state",
+            "error_code",
+            "error",
+            "available_boards",
+            "boards_truncated",
+        }:
+            if (
+                value.get("commit_state") != "not_committed"
+                or value.get("error_code")
+                not in {"board_not_found", "board_ambiguous"}
+                or not _safe_identity(value.get("error"))
+                or not isinstance(value.get("available_boards"), list)
+                or len(value["available_boards"]) > MAX_KANBAN_BOARD_CHOICES
+                or type(value.get("boards_truncated")) is not bool
+            ):
+                raise ValueError("kanban board choice result is malformed")
+            boards: list[dict[str, str]] = []
+            seen: set[str] = set()
+            for item in value["available_boards"]:
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"slug", "name"}
+                    or not isinstance(item.get("slug"), str)
+                    or _KANBAN_BOARD_SLUG.fullmatch(item["slug"]) is None
+                    or item["slug"] in seen
+                ):
+                    raise ValueError("kanban board choice result is malformed")
+                seen.add(item["slug"])
+                boards.append({
+                    "slug": item["slug"],
+                    "name": _safe_line(
+                        item.get("name"), max_chars=80, max_bytes=320
+                    ),
+                })
+            return {
+                "success": False,
+                "state": "not_committed",
+                "error_code": value["error_code"],
+                "error": _safe_line(
+                    value["error"], max_chars=240, max_bytes=960
+                ),
+                "available_boards": boards,
+                "boards_truncated": value["boards_truncated"],
+            }
+        if set(value) == {
+            "success",
+            "commit_state",
+            "operation_id",
+            "error_code",
+            "error",
+        }:
+            commit_state = value.get("commit_state")
+            error_code = value.get("error_code")
+            if not isinstance(commit_state, str) or not isinstance(
+                error_code, str
+            ):
+                raise ValueError("kanban operation failure is malformed")
+            expected_states = {
+                ("operation_conflict", "committed"): "historical_conflict",
+                ("operation_conflict", "unknown"): "outcome_unknown",
+                ("operation_conflict", "not_committed"): "not_committed",
+                ("board_generation_changed", "not_committed"): "not_committed",
+                ("operation_outcome_unknown", "unknown"): "outcome_unknown",
+            }
+            state = expected_states.get((error_code, commit_state))
+            if (
+                state is None
+                or value.get("operation_id") != operation_id
+                or value.get("error")
+                != _KANBAN_OPERATION_ERROR_MESSAGES.get(error_code)
+            ):
+                raise ValueError("kanban operation failure is malformed")
+            return {
+                "success": False,
+                "state": state,
+                "error_code": error_code,
+                "error": value["error"],
+            }
+        return _public_failure(value, "Hermes Kanban returned an invalid receipt")
+    receipt = _mutation_envelope(value)
+    if set(receipt) != {
+        "status",
+        "operation_id",
+        "task_id",
+        "created_status",
+        "created_assignee",
+        "board",
+    }:
+        raise ValueError("kanban task receipt is malformed")
+    if (
+        receipt.get("status")
+        not in {"acknowledged", "historical_acknowledgement"}
+        or receipt.get("operation_id") != operation_id
+        or not isinstance(receipt.get("task_id"), str)
+        or _KANBAN_TASK_ID.fullmatch(receipt["task_id"]) is None
+        or receipt.get("created_status") != "blocked"
+        or receipt.get("created_assignee") is not None
+        or not isinstance(receipt.get("board"), str)
+        or _KANBAN_BOARD_SLUG.fullmatch(receipt["board"]) is None
+    ):
+        raise ValueError("kanban task receipt is malformed")
+    return {
+        "success": True,
+        "state": "completed",
+        "status": receipt["status"],
+        "task_id": receipt["task_id"],
+        "created_status": receipt["created_status"],
+        "created_assignee": None,
+        "board": receipt["board"],
+    }
+
+
 def _decode_clock_result(
     value: Any,
     *,
@@ -824,6 +957,7 @@ class WorkflowService:
     async def call_tool(self, name: str, arguments: Any, meta: Any) -> dict[str, Any]:
         handlers = {
             "g2_work_task_add": self._work_task_add,
+            "g2_kanban_task_create": self._kanban_task_create,
             "g2_clock_set_timer": self._clock_set_timer,
             "g2_clock_set_alarm": self._clock_set_alarm,
             "g2_reminder_create": self._reminder_create,
@@ -960,6 +1094,37 @@ class WorkflowService:
             return _decode_work_task_result(value, operation_id=operation_id, lane=lane)
         except (RelayError, ValueError):
             return {"success": False, "state": "outcome_unknown", "error": "Work Tasks outcome could not be confirmed"}
+
+    async def _kanban_task_create(
+        self, arguments: Any, session: dict[str, Any]
+    ) -> dict[str, Any]:
+        args = _exact_args(arguments, {"title", "board"}, {"body"})
+        title = _safe_line(
+            args["title"], max_chars=120, max_bytes=MAX_TOOL_TEXT_BYTES
+        )
+        board = _safe_line(args["board"], max_chars=80, max_bytes=320)
+        payload: dict[str, Any] = {"title": title, "board": board}
+        if "body" in args:
+            payload["body"] = _safe_line(
+                args["body"], max_chars=2_000, max_bytes=8_000
+            )
+        operation_id = _stable_operation("kanban", session["claims"])
+        try:
+            value = await self._idempotent(
+                session,
+                "g2.kanban.task.create",
+                "kanban",
+                payload,
+            )
+            return _decode_kanban_task_result(
+                value, operation_id=operation_id
+            )
+        except (RelayError, ValueError):
+            return {
+                "success": False,
+                "state": "outcome_unknown",
+                "error": "Hermes Kanban outcome could not be confirmed",
+            }
 
     async def _clock_set_timer(self, arguments: Any, session: dict[str, Any]) -> dict[str, Any]:
         args = _exact_args(arguments, {"duration_seconds"}, {"label"})
@@ -1154,6 +1319,48 @@ _PRESENTATION_BLOCKED_SCHEMAS = tuple(
     for error_code, error in _PRESENTATION_BLOCKED_MESSAGES.items()
 )
 
+_KANBAN_BOARD_CHOICE_SCHEMA = _object_schema({
+    "slug": {"type": "string", "pattern": _KANBAN_BOARD_SLUG.pattern},
+    "name": {"type": "string", "minLength": 1, "maxLength": 80},
+}, ["slug", "name"])
+_KANBAN_SELECTION_FAILURE_SCHEMA = _object_schema({
+    "success": {"const": False},
+    "state": {"const": "not_committed"},
+    "error_code": {
+        "type": "string",
+        "enum": ["board_not_found", "board_ambiguous"],
+    },
+    "error": {"type": "string", "minLength": 1, "maxLength": 240},
+    "available_boards": {
+        "type": "array",
+        "maxItems": MAX_KANBAN_BOARD_CHOICES,
+        "items": _KANBAN_BOARD_CHOICE_SCHEMA,
+    },
+    "boards_truncated": {"type": "boolean"},
+}, [
+    "success",
+    "state",
+    "error_code",
+    "error",
+    "available_boards",
+    "boards_truncated",
+])
+_KANBAN_OPERATION_FAILURE_SCHEMAS = tuple(
+    _object_schema({
+        "success": {"const": False},
+        "state": {"const": state},
+        "error_code": {"const": error_code},
+        "error": {"const": _KANBAN_OPERATION_ERROR_MESSAGES[error_code]},
+    }, ["success", "state", "error_code", "error"])
+    for error_code, state in (
+        ("operation_conflict", "historical_conflict"),
+        ("operation_conflict", "outcome_unknown"),
+        ("operation_conflict", "not_committed"),
+        ("board_generation_changed", "not_committed"),
+        ("operation_outcome_unknown", "outcome_unknown"),
+    )
+)
+
 _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "g2_work_task_add": _one_of(
         _object_schema({
@@ -1164,6 +1371,26 @@ _BASE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "lane": {"type": "string", "enum": ["inbox", "today", "doing"]},
             "board_revision": {"type": "integer", "minimum": 1, "maximum": MAX_SAFE_INTEGER},
         }, ["success", "state", "status", "task_id", "lane", "board_revision"]),
+        _PUBLIC_FAILURE_SCHEMA,
+    ),
+    "g2_kanban_task_create": _one_of(
+        _object_schema({
+            "success": {"const": True},
+            "state": {"const": "completed"},
+            "status": {
+                "type": "string",
+                "enum": ["acknowledged", "historical_acknowledgement"],
+            },
+            "task_id": {"type": "string", "pattern": _KANBAN_TASK_ID.pattern},
+            "created_status": {"const": "blocked"},
+            "created_assignee": {"type": "null"},
+            "board": {"type": "string", "pattern": _KANBAN_BOARD_SLUG.pattern},
+        }, [
+            "success", "state", "status", "task_id", "created_status",
+            "created_assignee", "board",
+        ]),
+        _KANBAN_SELECTION_FAILURE_SCHEMA,
+        *_KANBAN_OPERATION_FAILURE_SCHEMAS,
         _PUBLIC_FAILURE_SCHEMA,
     ),
     "g2_clock_set_timer": _one_of(
@@ -1248,6 +1475,26 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "title": {"type": "string", "minLength": 1, "maxLength": 120},
             "lane": {"type": "string", "enum": ["inbox", "today", "doing"], "default": "inbox"},
         }, ["title"]),
+    },
+    {
+        "name": "g2_kanban_task_create",
+        "description": (
+            "Create one parked card on an existing Hermes Kanban board whose "
+            "slug or display name exactly matches board. The card is created "
+            "blocked with no assignee, so this workflow never starts a worker. "
+            "Use this for Hermes Kanban or named board requests; never substitute "
+            "the phone's local Work Tasks app."
+        ),
+        "inputSchema": _object_schema({
+            "title": {"type": "string", "minLength": 1, "maxLength": 120},
+            "board": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80,
+                "description": "Exact existing board slug or display name.",
+            },
+            "body": {"type": "string", "minLength": 1, "maxLength": 2_000},
+        }, ["title", "board"]),
     },
     {
         "name": "g2_clock_set_timer",
@@ -1427,8 +1674,9 @@ class WorkflowMcpServer:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 "instructions": (
-                    "Use these intent-complete tools for G2 Work Tasks, Clock, reminders, "
-                    "UK trains and UK public weather. Do not rebuild "
+                    "Use these intent-complete tools for G2 Work Tasks, parked Hermes "
+                    "Kanban cards, Clock, reminders, UK trains and UK public weather. "
+                    "Do not rebuild "
                     "these workflows with terminal, cron, browser, or arbitrary phone tools."
                 ),
             })

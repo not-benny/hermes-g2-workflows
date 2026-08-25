@@ -39,8 +39,19 @@ RAW_PHONE_NAMES = (
     "glasses_call",
 )
 
+RAW_KANBAN_NAMES = (
+    "kanban_create",
+    "kanban_list",
+    "kanban_update",
+    "kanban_delete",
+    "kanban_comment",
+    "kanban_dispatch",
+    "g2.kanban.task.create",
+)
+
 FINAL_MODEL_SURFACE = (
     "g2_work_task_add",
+    "g2_kanban_task_create",
     "g2_clock_set_timer",
     "g2_clock_set_alarm",
     "g2_reminder_create",
@@ -55,6 +66,8 @@ class DeviceWorkflowTests(unittest.TestCase):
         self.assertEqual(tuple(item["name"] for item in server.TOOLS), FINAL_MODEL_SURFACE)
         encoded = json.dumps(server.TOOLS, sort_keys=True)
         for raw_name in RAW_PHONE_NAMES:
+            self.assertNotIn(raw_name, encoded)
+        for raw_name in RAW_KANBAN_NAMES:
             self.assertNotIn(raw_name, encoded)
         self.assertNotIn("g2_notify_completed_result", encoded)
         self.assertNotIn("g2_device_call", encoded)

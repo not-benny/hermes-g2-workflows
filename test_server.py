@@ -73,6 +73,22 @@ def work_receipt(status: str):
     return make
 
 
+def kanban_receipt(status: str = "acknowledged"):
+    def make(_name, arguments, _authorization):
+        return {
+            "success": True,
+            "receipt": {
+                "status": status,
+                "operation_id": arguments["operation_id"],
+                "task_id": "t_1234abcd",
+                "created_status": "blocked",
+                "created_assignee": None,
+                "board": "hermes-g2",
+            },
+        }
+    return make
+
+
 def timer_receipt(status: str):
     def make(_name, arguments, _authorization):
         return {
@@ -245,7 +261,7 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(listed)
         tools = listed["result"]["tools"]
         self.assertEqual([item["name"] for item in tools], [item["name"] for item in server.TOOLS])
-        self.assertEqual(len(tools), 12)
+        self.assertEqual(len(tools), 13)
         for item in tools:
             self.assertIn("outputSchema", item)
             self.assertEqual(item["inputSchema"].get("type"), "object")
@@ -348,6 +364,213 @@ class WorkflowMcpTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(relay.calls[0][1]["operation_id"], relay.calls[1][1]["operation_id"])
         self.assertNotEqual(relay.calls[1][1]["operation_id"], relay.calls[2][1]["operation_id"])
+
+    async def test_kanban_create_is_exact_parked_and_retry_safe(self) -> None:
+        relay = FakeRelay({
+            "g2.kanban.task.create": [
+                kanban_receipt(),
+                {
+                    "success": False,
+                    "commit_state": "unknown",
+                    "operation_id": "ignored-by-retry",
+                    "error": "receipt lost",
+                },
+                kanban_receipt("historical_acknowledgement"),
+            ],
+        })
+        instance = await initialized_server(relay)
+        arguments = {
+            "title": "Mimecast creation",
+            "body": "Waiting for account owner input",
+            "board": "Hermes G2",
+        }
+        result, payload = await call_tool(
+            instance,
+            "g2_kanban_task_create",
+            arguments,
+            meta=session_meta(
+                "g2_kanban_task_create", arguments, "kanban-call-1"
+            ),
+        )
+        self.assertIs(result["isError"], False)
+        self.assertEqual(payload, {
+            "success": True,
+            "state": "completed",
+            "status": "acknowledged",
+            "task_id": "t_1234abcd",
+            "created_status": "blocked",
+            "created_assignee": None,
+            "board": "hermes-g2",
+        })
+        name, native, authorization = relay.calls[0]
+        self.assertEqual(name, "g2.kanban.task.create")
+        self.assertEqual(native["title"], arguments["title"])
+        self.assertEqual(native["body"], arguments["body"])
+        self.assertEqual(native["board"], arguments["board"])
+        self.assertRegex(native["operation_id"], r"^kanban\.[a-f0-9]{32}$")
+        self.assertEqual(authorization["workflow"], "g2_kanban_task_create")
+
+        retry_arguments = {"title": "Retry me", "board": "hermes-g2"}
+        retry_result, retry_payload = await call_tool(
+            instance,
+            "g2_kanban_task_create",
+            retry_arguments,
+            meta=session_meta(
+                "g2_kanban_task_create", retry_arguments, "kanban-call-2"
+            ),
+            request_id=13,
+        )
+        self.assertIs(retry_result["isError"], False)
+        self.assertEqual(retry_payload["status"], "historical_acknowledgement")
+        self.assertEqual(relay.calls[1][1], relay.calls[2][1])
+        self.assertEqual(relay.calls[1][2]["subcall_id"], 1)
+        self.assertEqual(relay.calls[1][2]["attempt"], 1)
+        self.assertEqual(relay.calls[2][2]["subcall_id"], 1)
+        self.assertEqual(relay.calls[2][2]["attempt"], 2)
+
+    async def test_kanban_missing_board_returns_typed_bounded_choices(self) -> None:
+        arguments = {"title": "Mimecast creation", "board": "Blocker"}
+        relay = FakeRelay({
+            "g2.kanban.task.create": [{
+                "success": False,
+                "commit_state": "not_committed",
+                "error_code": "board_not_found",
+                "error": "No active Hermes Kanban board exactly matches that name",
+                "available_boards": [
+                    {"slug": "default", "name": "Default"},
+                    {"slug": "hermes-g2", "name": "Hermes G2"},
+                ],
+                "boards_truncated": False,
+            }],
+        })
+        instance = await initialized_server(relay)
+        result, payload = await call_tool(
+            instance,
+            "g2_kanban_task_create",
+            arguments,
+            meta=session_meta("g2_kanban_task_create", arguments),
+        )
+        self.assertIs(result["isError"], True)
+        self.assertEqual(payload, {
+            "success": False,
+            "state": "not_committed",
+            "error_code": "board_not_found",
+            "error": "No active Hermes Kanban board exactly matches that name",
+            "available_boards": [
+                {"slug": "default", "name": "Default"},
+                {"slug": "hermes-g2", "name": "Hermes G2"},
+            ],
+            "boards_truncated": False,
+        })
+        self.assertEqual(len(relay.calls), 1)
+
+    async def test_kanban_committed_payload_conflict_is_typed_and_not_retried(
+        self,
+    ) -> None:
+        arguments = {"title": "Changed title", "board": "Hermes G2"}
+
+        def committed_conflict(_name, native, _authorization):
+            return {
+                "success": False,
+                "commit_state": "committed",
+                "operation_id": native["operation_id"],
+                "error_code": "operation_conflict",
+                "error": (
+                    "Kanban operation identity is already bound to different "
+                    "arguments"
+                ),
+            }
+
+        relay = FakeRelay({
+            "g2.kanban.task.create": [committed_conflict],
+        })
+        instance = await initialized_server(relay)
+        result, payload = await call_tool(
+            instance,
+            "g2_kanban_task_create",
+            arguments,
+            meta=session_meta("g2_kanban_task_create", arguments),
+        )
+
+        self.assertIs(result["isError"], True)
+        self.assertEqual(payload, {
+            "success": False,
+            "state": "historical_conflict",
+            "error_code": "operation_conflict",
+            "error": (
+                "Kanban operation identity is already bound to different "
+                "arguments"
+            ),
+        })
+        self.assertEqual(len(relay.calls), 1)
+
+    async def test_kanban_operation_failures_and_creation_facts_are_exact(
+        self,
+    ) -> None:
+        operation_id = "kanban." + "4" * 32
+        messages = server._KANBAN_OPERATION_ERROR_MESSAGES
+        cases = (
+            ("operation_conflict", "committed", "historical_conflict"),
+            ("operation_conflict", "unknown", "outcome_unknown"),
+            ("operation_conflict", "not_committed", "not_committed"),
+            ("board_generation_changed", "not_committed", "not_committed"),
+            ("operation_outcome_unknown", "unknown", "outcome_unknown"),
+        )
+        for error_code, commit_state, public_state in cases:
+            native = {
+                "success": False,
+                "commit_state": commit_state,
+                "operation_id": operation_id,
+                "error_code": error_code,
+                "error": messages[error_code],
+            }
+            self.assertEqual(
+                server._decode_kanban_task_result(
+                    native, operation_id=operation_id
+                ),
+                {
+                    "success": False,
+                    "state": public_state,
+                    "error_code": error_code,
+                    "error": messages[error_code],
+                },
+            )
+
+        exact_receipt = {
+            "success": True,
+            "receipt": {
+                "status": "historical_acknowledgement",
+                "operation_id": operation_id,
+                "task_id": "t_1234abcd",
+                "created_status": "blocked",
+                "created_assignee": None,
+                "board": "hermes-g2",
+            },
+        }
+        decoded = server._decode_kanban_task_result(
+            exact_receipt, operation_id=operation_id
+        )
+        self.assertEqual(decoded["created_status"], "blocked")
+        self.assertIsNone(decoded["created_assignee"])
+        self.assertNotIn("task_status", decoded)
+
+        malformed = copy.deepcopy(exact_receipt)
+        malformed["receipt"]["created_assignee"] = "even-g2"
+        with self.assertRaises(ValueError):
+            server._decode_kanban_task_result(
+                malformed, operation_id=operation_id
+            )
+        wrong_message = {
+            "success": False,
+            "commit_state": "committed",
+            "operation_id": operation_id,
+            "error_code": "operation_conflict",
+            "error": "untrusted detail",
+        }
+        with self.assertRaises(ValueError):
+            server._decode_kanban_task_result(
+                wrong_message, operation_id=operation_id
+            )
 
     async def test_unknown_commit_retries_once_with_the_identical_internal_id(self) -> None:
         relay = FakeRelay({
